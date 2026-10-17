@@ -24,6 +24,7 @@
 
 #include "devices/timer.h"
 #define MAX_ARGS 64
+#define ALIGN sizeof(long)
 
 #define ALIGN sizeof(double)
 
@@ -209,7 +210,7 @@ process_wait (tid_t child_tid UNUSED) {
 	 * XXX:       process_wait를 구현하기 전에 여기에 무한 루프를
 	 * XXX:       추가해 두기를 권장함. */
 	thread_set_priority(PRI_MIN);
-	// timer_sleep (TIMER_FREQ * 5);
+	timer_sleep (TIMER_FREQ * 5);
 	return -1;
 }
 
@@ -321,6 +322,7 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		uint32_t read_bytes, uint32_t zero_bytes,
 		bool writable);
 
+
 /* FILE_NAME의 ELF 실행 파일을 현재 스레드에 로드함.
  * 실행 파일의 진입점(entry point)을 *RIP에,
  * 초기 스택 포인터를 *RSP에 저장함.
@@ -347,11 +349,21 @@ load (const char *file_name, struct intr_frame *if_) {
 	for (token = strtok_r (file_name, " ", &save_ptr); token != NULL && argc < MAX_ARGS-1; token = strtok_r (NULL, " ", &save_ptr)) {
 		argv[argc++] = token;
 	}
+<<<<<<< Updated upstream
 	argv[argc] = NULL;
+=======
+>>>>>>> Stashed changes
 
 	if (argc <= 0 || argc > MAX_ARGS) {
 		goto done;
 	}
+<<<<<<< Updated upstream
+=======
+	
+	// for (int i = 0; i < argc; i++) {
+	// 	printf("%s\n", argv[i]);
+	// }
+>>>>>>> Stashed changes
 
 	/* 실행 파일을 엶. */
 	file = filesys_open (argv[0]);
@@ -431,6 +443,7 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	/* 시작 주소. */
 	if_->rip = ehdr.e_entry;
+<<<<<<< Updated upstream
 
 	uint8_t *ptr = (uint8_t *) if_->rsp;
 
@@ -454,6 +467,54 @@ load (const char *file_name, struct intr_frame *if_) {
     if_->R.rdi = argc;
     if_->R.rsi = (uint64_t) argv_addr;
     if_->rsp = (uintptr_t) ptr;
+=======
+	size_t sum = 0;
+	uint8_t *str_ptr = (uint8_t *) if_->rsp;		// 그냥 (uint8_t로 하면 바이트 정수를 담는거라 주소가 잘림)
+	uint8_t *base_str_ptr = str_ptr;
+
+	uint64_t len_arr[MAX_ARGS];
+
+	/* 시작주소부터 명령어 잘라서 문자열 넣고 스택 포인터 이동 */
+	for (int i = argc-1; i >= 0; i--) {
+		size_t str_len = strlen(argv[i]) + 1;
+		len_arr[i] = str_len;
+
+		str_ptr -= str_len;
+
+		printf("[argv] i=%d slot=%p base=%p\n", i, (void *)str_ptr, (void *)base_str_ptr);
+
+		strlcpy((uint8_t *)str_ptr, argv[i], str_len);
+		sum += str_len;
+	}
+
+	/* 8배수 맞추기 위한 패딩 계산 후 str 위치 이동 */
+	size_t padding = ROUND_UP(sum, ALIGN) - sum;
+	str_ptr -= padding;
+	memset(str_ptr, 0, padding);
+
+	/* argv 마지막 값 NULL이므로 8바이트 공간만큼 이동하고 0채우기*/
+	str_ptr -= ALIGN;
+	memset(str_ptr, 0, ALIGN);
+
+	/* 주소공간에 각 문자열의 시작주소 넣어주기 */
+	for (int i = argc-1; i >= 0; i--) {
+		size_t str_len = strlen(argv[i]) + 1;
+
+		str_ptr -= ALIGN;
+		base_str_ptr -= len_arr[i];
+		memcpy(str_ptr, &base_str_ptr, ALIGN);
+	}
+
+	uint64_t *rsi_ptr = str_ptr;
+
+	/* 가짜 리턴 주소 공간*/
+	str_ptr -= ALIGN;
+	memset(str_ptr, 0, ALIGN);
+
+	if_->R.rdi = argc;
+	if_->R.rsi = (uint64_t)rsi_ptr;
+	if_->rsp = (uintptr_t)str_ptr;
+>>>>>>> Stashed changes
 
 	success = true;
 
