@@ -8,6 +8,7 @@ struct file;
 extern struct lock filesys_lock;
 
 void syscall_init (void);
+void sys_exit(int status);  /* 종료 상태 기록하고 현재 프로세스 종료 */
 
 /* fd 테이블 */
 void fd_table_create (void);

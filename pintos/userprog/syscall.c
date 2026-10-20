@@ -9,18 +9,19 @@
 #include "intrinsic.h"
 #include "userprog/process.h"
 #include "threads/malloc.h"
-#include "filesys/file.h"
-#include "filesys/filesys.h"
+#include "threads/init.h"
+/* 명령줄 복사, 메모리 할당, 사용자 주소 검사에 사용 */
+#include <string.h>
 #include "threads/palloc.h"
 #include "threads/vaddr.h"
-#include "devices/input.h"
+#include "threads/mmu.h"
 
+#include "filesys/file.h"		// struct file
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
 
 
-void check_address (const void *addr); 
 
 /* 시스템 콜(System call).
  *
@@ -35,12 +36,12 @@ void check_address (const void *addr);
 #define MSR_LSTAR 0xc0000082        /* 롱 모드(Long mode) SYSCALL 대상 */
 #define MSR_SYSCALL_MASK 0xc0000084 /* eflags용 마스크 */
 
-#define FD_MAX (PGSIZE / sizeof(struct file *))	 /* 페이지 한 장 = 512칸 */
-struct lock filesys_lock;           /* 전역 파일 시스템 락 */
+void fd_table_create(void) {
+    thread_current()->fd_table = palloc_get_page(PAL_ZERO);
+}
 
 void
 syscall_init (void) {
-	lock_init(&filesys_lock);
 	write_msr(MSR_STAR, ((uint64_t)SEL_UCSEG - 0x10) << 48  |
 			((uint64_t)SEL_KCSEG) << 32);
 	write_msr(MSR_LSTAR, (uint64_t) syscall_entry);
@@ -52,300 +53,143 @@ syscall_init (void) {
 			FLAG_IF | FLAG_TF | FLAG_DF | FLAG_IOPL | FLAG_AC | FLAG_NT);
 }
 
-/*
-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-fd_table 빨간줄 뜨는거 정상입니다.
-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-*/
-
-/* 임시로 주소 확인 */
-void check_address(const void *addr) {
-	if (addr == NULL || !is_user_vaddr(addr) || pml4_get_page(thread_current()->pml4, addr) == NULL) {
-		thread_exit(); // 임시
-	}
+static struct file *find_file_by_fd(int fd) {
+	/*전달받은 fd에 해당하는 항목 찾기
+ 	찾았다면 해당 항목의 struct file * 반환
+ 	없다면 NULL 반환*/
+	return NULL;
 }
 
-/**
- * @brief 현재 스레드의 fd 테이블을 할당함
- *
- * @details palloc_get_page(PAL_ZERO)로 페이지 한 장을 받아 FD_MAX칸 전부 NULL인 상태로 시작함.
- *
- * @note 할당에 실패하면 fd_table은 NULL로 남고, 이후 fd_add()가 -1을 반환함.
- */
-void fd_table_create(void) {
-	thread_current()->fd_table = palloc_get_page(PAL_ZERO);
-}
-
-/**
- * @brief fd에 연결된 열린 파일을 찾음
- *
- * @param fd 유저가 넘긴 파일 디스크립터
- * @return 연결된 struct file *. 테이블이 없거나, fd가 2 미만·FD_MAX 이상이거나, 빈 칸이면 NULL
- *
- * @note 잘못된 fd여도 exit하지 않음. 범위 검사는 이 함수 한 곳에서만 함.
- */
-static struct file *fd_get(int fd) {
-	struct file **table = thread_current()->fd_table;
-
-	if (table == NULL || fd < 2 || fd >= (int)FD_MAX) {
-		return NULL;
-	}
-	return table[fd];
-}
-
-/**
- * @brief 열린 파일을 fd 테이블의 빈 칸에 등록함
- *
- * @param file 등록할 열린 파일
- * @return 배정된 fd (2번부터 비어 있는 가장 작은 번호). 테이블이 없거나 꽉 차면 -1
- *
- * @note 실패해도 file을 닫지 않음. 호출한 쪽이 닫아야 함.
- */
-int fd_add(struct file *file) {
-	struct file **table = thread_current()->fd_table;
-
-	if (table == NULL) {
-		return -1;
-	}
-	for (int fd = 2; fd < (int)FD_MAX; fd++) {
-		if (table[fd] == NULL) {
-			table[fd] = file;
-			return fd;
-		}
-	}
-	return -1;
-}
-
-/**
- * @brief fd에 연결된 파일을 닫고 칸을 비움
- *
- * @param fd 닫을 파일 디스크립터
- *
- * @note 잘못된 fd나 이미 닫은 fd면 아무것도 하지 않음.
- * @note file_close() 호출 부분만 filesys_lock을 잡음.
- */
-void fd_close(int fd) {
-	struct file *file = fd_get(fd);
-
-	if (file == NULL) {
-		return;
-	}
-	thread_current()->fd_table[fd] = NULL;
-
-	lock_acquire(&filesys_lock);
-	file_close(file);
-	lock_release(&filesys_lock);
-}
-
-/**
- * @brief 열린 파일을 모두 닫고 fd 테이블 페이지를 해제함
- *
- * @details 프로세스 종료 시 process_exit()에서 호출함.
- *
- * @note 테이블이 없으면(커널 스레드, fork 실패) 아무것도 하지 않음.
- */
-void fd_table_close_all(void) {
+void sys_exit(int status) {
 	struct thread *cur = thread_current();
 
-	if (cur->fd_table == NULL) {
-		return;
+	if (cur->child_info != NULL) {
+		cur->child_info->status = status;
 	}
-	for (int fd = 2; fd < (int)FD_MAX; fd++) { // 0,1은 예약이라고 가정
-		fd_close(fd);
-	}
-	palloc_free_page(cur->fd_table);
-	cur->fd_table = NULL;
+	thread_exit();
 }
 
+static void sys_wait(struct intr_frame *f) {
+	tid_t child_tid = (tid_t)f->R.rdi;
+
+	f->R.rax = process_wait(child_tid);
+}
+
+static void sys_halt(void) {
+	power_off();
+}
+
+static void sys_exec(struct intr_frame *f) {
+    /* exec에 전달한 명령줄의 사용자 주소를 가져옴 */
+    const char *command_line = (const char *)f->R.rdi;
+    size_t length;
+
+    /* 초안에서는 명령줄을 널 문자까지 포함해 한 페이지로 제한.
+     * 문자열을 읽기 전에 각 주소가 유효한지 먼저 검사. */
+    for (length = 0; length < PGSIZE; length++) {
+        const char *addr = (const char *)((uintptr_t)command_line + length);
+
+        /* 커널 주소 검사를 먼저 해서 페이지 조회의 ASSERT를 피한다. */
+        if (addr == NULL || !is_user_vaddr(addr) || pml4_get_page(thread_current()->pml4, addr) == NULL) {
+            sys_exit(-1);
+		}
+
+        /* 문자열 끝을 찾으면 길이 확인을 마친다. */
+        if (*addr == '\0') {
+            break;
+		}
+    }
+
+    /* 한 페이지 안에 문자열 끝이 없으면 실행하지 않는다. */
+    if (length == PGSIZE) {
+        sys_exit(-1);
+	}
+
+    /* 기존 사용자 메모리가 지워져도 유지될 커널 공간을 확보한다. */
+    char *copy = palloc_get_page(0);
+    if (copy == NULL) {
+        sys_exit(-1);
+	}
+
+    /* 끝의 널 문자까지 복사한다. */
+    memcpy(copy, command_line, length + 1);
+
+    /* copy는 기존 process_exec()가 성공·실패 모두에서 해제한다.
+     * 성공하면 돌아오지 않고, 로드 실패로 돌아오면 종료한다. */
+    if (process_exec(copy) < 0)
+        sys_exit(-1);
+}
+
+//putbuf (const char *buffer, size_t n)
 /* 시스템 콜의 메인 인터페이스 */
 void
 syscall_handler (struct intr_frame *f UNUSED) {
+	// TODO: 여기에 구현을 작성할 것.
 	int fd = f->R.rdi;
-	switch (f->R.rax)
-	{
-		case SYS_HALT:
-			break;
-		case SYS_EXIT: {		/* exit(status) 첫 인자는 rdi로 전달 */
-			int status = (int)f->R.rdi;
-			struct thread *cur = thread_current();
 
-			struct exit_info *record = malloc(sizeof(struct exit_info));		/* 종료 상태 저장할 실제 메모리 공간 할당 */
-			if (record == NULL) {		/* 할당 실패하면 기록에 접근하지 않고 현재 스레드 종료 */
-				thread_exit();
+	switch (f->R.rax) {
+		case SYS_EXIT: {		/* exit(status) 첫 인자는 rdi로 전달 */
+			sys_exit((int)f->R.rdi);	/* 사용자가 exit(status)에 넘긴 첫 번쨰 인자는 rdi에 들어 있음*/
+			break;
+		}
+
+		case SYS_WAIT: {
+			sys_wait(f);
+			break;
+		}
+
+		case SYS_HALT: {
+			sys_halt();
+			break;
+		}
+
+		case SYS_EXEC: {
+			/* 명령줄 검사와 실행 교체를 담당 함수에 맡긴다. */
+			sys_exec(f);
+			break;
+		}
+
+		case SYS_FILESIZE: {
+			struct file *file = find_file_by_fd(fd);		// 실제 파일 조회는 이후 open 구현 후 fd 관리 코드와 연결
+			
+			if (file == NULL) {		// fd에 연결된 파일 없으면 실패(-1) 반환
+				printf("[filesize] 파일 번호 %d에 해당하는 열린 파일 찾지 못했습니다.\n", fd);
+				f->R.rax = -1;
+				break;
 			}
 			
-			record->status = status;		// 구조체 안에 종료 상태 저장
+			int size = file_length(file);		// 파일 크기 조회해서 리턴
+			printf("[filesize] 파일번호(fd) = %d, 파일 크기(size) = %d\n", fd, size);
 
-			cur->exit_info = record;		// process_exit()에서도 같은 기록 찾을 수 있도록 현재 스레드에 구조체 주소 저장
+			f->R.rax = size;
 
-			thread_exit();		/* 내부에서 process_exit() 호출해 자원 정리하고 현재 스레드 종료 */
-		}
-		case SYS_FORK:
-			break;
-		case SYS_EXEC:
-			break;
-		case SYS_WAIT:
-			break;
-		case SYS_CREATE: {
-			const char *create_file_name = (const char *)f->R.rdi;
-			unsigned initial_size = (unsigned)f->R.rsi;
-
-			check_address(create_file_name);
-
-			lock_acquire(&filesys_lock);
-			f->R.rax = filesys_create(create_file_name, initial_size);
-			lock_release(&filesys_lock);
-
+			printf("[filesize] fd = %d\n", fd);
 			break;
 		}
-		case SYS_REMOVE: {
-			const char *remove_file_name = (const char *)f->R.rdi;
 
-			check_address(remove_file_name);
-
-			lock_acquire(&filesys_lock);
-			f->R.rax = filesys_remove(remove_file_name);
-			lock_release(&filesys_lock);
-
-			break;
-		}
-		case SYS_OPEN: {
-			const char *open_file_name = (const char *)f->R.rdi;
-
-			check_address(open_file_name);
-
-			lock_acquire(&filesys_lock);
-			struct file *file = filesys_open(open_file_name);
-			lock_release(&filesys_lock);
-
-			if (file == NULL) {	// 없는 파일이거나 빈 이름이면 실패(-1)
-				f->R.rax = -1;
-				break;
-			}
-
-			int new_fd = fd_add(file);
-			if (new_fd == -1) {	// fd 테이블이 꽉 차면 열어 둔 파일을 닫고 실패
-				lock_acquire(&filesys_lock);
-				file_close(file);
-				lock_release(&filesys_lock);
-			}
-			f->R.rax = new_fd;
-
-			break;
-		}
-		case SYS_FILESIZE: {
-			int fd = f->R.rdi;
-			struct file *file = fd_get(fd); // 실제 파일 조회는 이후 open 구현 후 fd 관리 코드와 연결
-
-			if (file == NULL) {	// fd에 연결된 파일 없으면 실패(-1) 반환
-				f->R.rax = -1;
-				break;
-			}
-
-			lock_acquire(&filesys_lock);
-			f->R.rax = file_length(file); // 파일 크기 조회해서 리턴
-			lock_release(&filesys_lock);
-
-			break;
-		}
-		case SYS_READ: {
-			/*
-			int
-			read (int fd, void *buffer, unsigned size) {
-				return syscall3 (SYS_READ, fd, buffer, size);
-			}
-			rax rdi rsi rdx
-			*/
-			void * buffer = (void *)f->R.rsi;
-			unsigned size = (unsigned)f->R.rdx;
-
-			check_address(buffer);
-
-			if (fd == 0) {
-				uint8_t *buf = buffer;
-				for (unsigned i = 0; i < size; i++) {
-					buf[i] = input_getc(); // 키보드에서 한 글자씩 읽어 버퍼에 저장
-				}
-				f->R.rax = size;
-			}
-			else if(fd == 1) {
-				f->R.rax = -1;
-			}
-			else {
-				struct file* fd_file =fd_get(fd);
-				if (fd_file == NULL) {
-					f->R.rax = -1;
-					break;
-				}
-
-				lock_acquire(&filesys_lock);
-				f->R.rax = file_read(fd_file, buffer, size); // 실제로 읽은 바이트 수 반환
-				lock_release(&filesys_lock);
-			}
-
-			break;
-		}
-		case SYS_WRITE: {
-			/*
-			int
-			write (int fd, const void *buffer, unsigned size) {
-				return syscall3 (SYS_WRITE, fd, buffer, size);
-			}
-			rax rdi rsi rdx
-			*/
-			const void *buffer = (const void *)f->R.rsi;
-			unsigned size = (unsigned)f->R.rdx;
-
-			check_address(buffer);
-
-			if (fd == 1) {
-				putbuf(buffer, size);
-				f->R.rax = size;
-			}
-			else {
-				struct file* fd_file =fd_get(fd);
-				if (fd_file == NULL) {	// fd 0이나 잘못된 fd면 실패(-1), exit 안 함
-					f->R.rax = -1;
-					break;
-				}
-				lock_acquire(&filesys_lock);
-				f->R.rax = file_write(fd_file, buffer, size); // 실제로 쓴 바이트 수 반환
-				lock_release(&filesys_lock);
-			}
-			break;
-		}
-		case SYS_SEEK:
-		/*
-		void
-		seek (int fd, unsigned position) {
-			syscall2 (SYS_SEEK, fd, position);
-		}
-		rax rdi 
-		*/
-			unsigned position = f->R.rdi;
-
-			break;
 		case SYS_TELL: {
-			int fd = f->R.rdi;
-			struct file *file = fd_get(fd);
+			struct file *file = find_file_by_fd(fd);
 
 			if (file == NULL) {
+				printf("[tell] 파일 번호 %d에 해당하는 열린 파일 찾지 못했습니다.\n", fd);
 				f->R.rax = -1;
 				break;
 			}
+			
+			int file_loc = file_tell(file);
+			printf("[tell] 파일번호(fd) = %d, 현재 위치(file_loc) = %d\n", fd, file_loc);
 
-			lock_acquire(&filesys_lock);
-			f->R.rax = file_tell(file);
-			lock_release(&filesys_lock);
+			f->R.rax = file_loc;
 
 			break;
 		}
-		case SYS_CLOSE:
-			fd_close(fd);	// 잘못된 fd나 이미 닫은 fd는 그냥 무시
+
+		case SYS_SEEK: {
 			break;
-		case SYS_DUP2:
+		}
+
+		default: 
 			break;
-		default:
-			break;
+			
 	}
 }

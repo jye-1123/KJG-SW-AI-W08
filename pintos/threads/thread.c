@@ -294,7 +294,7 @@ thread_create (const char *name, int priority, thread_func *function, void *aux)
 	t->tf.eflags = FLAG_IF;
 
 	/* user program */
-	list_push_back(&thread_current()->children, &t->process_elem);
+	// list_push_back(&thread_current()->children, &t->process_elem);
 
 	/* run queue에 추가함. */
 	thread_unblock (t);

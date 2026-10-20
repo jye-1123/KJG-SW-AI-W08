@@ -20,6 +20,7 @@
 #include "intrinsic.h"
 #include "threads/synch.h"
 #include "userprog/syscall.h"
+#include "threads/malloc.h"
 
 #ifdef VM
 #include "vm/vm.h"
@@ -35,11 +36,20 @@ static bool load (const char *file_name, struct intr_frame *if_);
 static void initd (void *f_name);
 static void __do_fork (void *);
 
+static struct child_info *child_info_create(void);
+static void child_info_release(struct child_info *record);
+
 /* initd 및 다른 프로세스를 위한 일반 프로세스 초기화 함수. */
 static void
 process_init (void) {
 	struct thread *current = thread_current ();
 }
+
+struct initd_args {
+	char *command_line;
+	struct child_info *record;
+};
+
 
 /* FILE_NAME에서 로드한 첫 번째 유저랜드(userland) 프로그램 "initd"를
  * 시작함.
@@ -75,17 +85,57 @@ process_create_initd (const char *file_name) {
 		return TID_ERROR;
 	}
 	
+	/* 부모와 자식이 나중에 이 기록 공간 주소 받아 같은 공간 사용할거임 */
+	struct child_info *record = child_info_create();
 
-	/* FILE_NAME을 실행할 새 스레드를 생성함. */
-	tid = thread_create (program_name, PRI_DEFAULT, initd, fn_copy);
-	if (tid == TID_ERROR)
-		palloc_free_page (fn_copy);
+	if (record == NULL) {			/* 만들기 실패했으면 자식 생성 중단하고 앞에서 확보한 명령줄 복사본은 부모가 직접 해제*/
+		palloc_free_page(fn_copy);
+		return TID_ERROR;
+	}
+
+	struct initd_args *args = malloc(sizeof *args);		/* 부모 함수 반환 후에도 자식이 읽을 수 있도록 동적 공간 할당*/
+	
+	if (args == NULL) {		/* 아직 자식 안만들었으니 두 공간 모두 부모가 해제 */
+		free(record);
+		palloc_free_page(fn_copy);
+		return TID_ERROR;
+	}
+	
+	args->command_line = fn_copy;
+	args->record = record;
+	/* 부모가 wait에서 찾을 수 있도록 기록을 자식 목록에 연결 */
+	list_push_back(&thread_current()->children, &record->elem);
+	/* 준비할 묶음을 새 자식의 initd()에 전달 */
+	tid = thread_create(program_name, PRI_DEFAULT, initd, args);
+
+	if (tid == TID_ERROR) {
+		/* 생성 실패 시 목록에서 먼저 빼고 메모리 해제 */
+		list_remove(&record->elem);
+		free(args);
+		free(record);
+		palloc_free_page(fn_copy);
+		return TID_ERROR;
+	}
+	record->tid = tid;
+
 	return tid;
 }
 
-/* 첫 번째 유저 프로세스를 실행하는 스레드 함수. */
+/* 첫 번째 유저 프로세스를 실행하는 스레드 함수.
+   여기부터는 새로 만들어진 자식 스레드가 실행*/
 static void
 initd (void *f_name) {
+	struct initd_args *args = f_name;	/* 부모가 전달한 주소를 원래 전달용 구조체 포인터로 받음 */
+	struct thread *cur = thread_current();
+
+	cur->child_info = args->record;		/* 부모와 공유할 기록의 주소를 자식 자신에게 저장*/
+	// cur->child_info->tid = cur->tid;		/* 자신 번호를 기록 공간에 채워둠 */
+
+	char *command_line = args->command_line;
+
+	free(args);
+
+
 #ifdef VM
 	supplemental_page_table_init (&thread_current ()->spt);
 #endif
@@ -93,7 +143,7 @@ initd (void *f_name) {
 	process_init ();
 	fd_table_create ();
 
-	if (process_exec (f_name) < 0)
+	if (process_exec (command_line) < 0)
 		PANIC("Fail to launch initd\n");
 	NOT_REACHED ();
 }
@@ -215,6 +265,47 @@ process_exec (void *f_name) {
 	NOT_REACHED ();
 }
 
+/* 자식 스레드 생성 시점에 child_info 생성 */
+static struct child_info *child_info_create(void) {
+	struct child_info *record = malloc(sizeof *record);
+
+	if (record == NULL) {
+		return NULL;
+	}
+	
+	record->tid = TID_ERROR;
+	record->status = -1;
+	sema_init(&record->process_sema, 0);
+	record->refs = 2;		/* 자식 생성에 실패하면 기존 실패 처리에서 record 전체 바로 해제 */
+	lock_init(&record->refs_lock);		/* 사용 횟수를 변경할 때 사용할 락 초기화 */
+
+	return record;
+}
+
+/** 
+ * 부모 또는 자식이 이 기록의 사용을 끝낼 때 한 번 호출한다
+ * 호출한 쪽은 이 함수가 끝난 뒤 record를 다시 사용하면 안 된다
+ */
+static void child_info_release(struct child_info *record) {
+	if (record == NULL) {
+		return;
+	}
+	/* 사용 횟수 변경과 마지막 사용자 판단을 함께 보호 */
+	lock_acquire(&record->refs_lock);
+	/* 사용 횟수가 이미 0이라면 호출 횟수나 관리 흐름에 오류 */
+	ASSERT(record->refs > 0);
+	/* 현재 호출한 부모 또는 자식의 사용 몫을 하나 반납*/
+	record->refs--;
+	/* 락을 잡고 있을 때 해제 여부를 판단해 지역 변수에 저장 */
+	bool last_user = (record->refs == 0);
+	/* 락도 record 안에 있으므로, 기록을 해제하기 전에 먼저 풀어야 함*/
+	lock_release(&record->refs_lock);
+
+	/* 마지막 사용자만 실제 기록 공간을 해제 */
+	if (last_user) {
+		free(record);
+	}
+}
 
 /* 스레드 TID가 종료되기를 기다렸다가 그 종료 상태(exit status)를
  * 반환함.  커널에 의해 종료된 경우(즉, 예외로 인해 kill된 경우)
@@ -236,15 +327,17 @@ process_wait (tid_t child_tid) {
 	struct list_elem *e = list_begin(&thread_current()->children);
 	
 	while (e != list_end(&thread_current()->children)) {
-		struct thread *child = list_entry(e, struct thread, process_elem);
+		struct child_info *child = list_entry(e, struct child_info, elem);
+
 		if (child->tid == child_tid) {
-			sema_down(&child->process_sema);
-			return 1;
+			list_remove(&child->elem);	/* 같은 자식을 다시 가지지 못하도록 부모 목록에서 제거 */
+			sema_down(&child->process_sema);	/* 자식의 종료 알림이 올 때까지 부모가 기다린다 */
+			int status = child->status;	/* 기록 사용 끝내기 전에 종료 상태 보관해두기 */
+			child_info_release(child);	/* 부모가 가진 기록 사용 몫을 반납 */
+			return status;		/* 기존의 고장값 1 대신 자식의 실제 종료 상태 반환 */
 		}
-
-		e = list_next(e);
+		e = list_next(e);	/* 번호가 다르면 다음 기록으로 이동 */
 	}
-
 	return -1;
 }
 
@@ -259,13 +352,36 @@ process_exit (void) {
 	/* 현재 종료 기록은 SYS_EXIT 처리 중에만 생성
 	* 커널 스레드 종료나 예외 종료 등에서는 기록이 없을 수 있으므로
 	* 기록이 존재할 때만 종료 상태를 읽고 출력*/
-	if (curr->exit_info != NULL) {	
-		printf("%s: exit(%d)\n", curr->name, curr->exit_info->status);
+	/**
+	 * 부모: 기다리지 않고 남겨둔 자식 기록의 사용 몫 반납
+	 * 자식: 자신의 종료를 알리고 자신의 기록 사용 몫 반남
+	 */
+	struct child_info *record = curr->child_info;
+
+	if (record != NULL) {
+		printf("%s: exit(%d)\n", curr->name, record->status);
 	}
-	/* 종료 기록의 유무와 관계없이 현재 프로세스 주소 공간 정리
-	별도로 할당한 exit_info의 해제는 아직 구현x */
-	sema_up(&curr->process_sema);
-	process_cleanup (); 
+
+	/** 자신도 부모일 수 있음
+	 * wait()하지 않은 자식 기록들을 목록에서 하나씩 꺼낸다
+	 * 이미 wiat한 기록은 목록에서 제거됐으므로 여기에 없음
+	 */
+	while (!list_empty(&curr->children)) {
+		struct list_elem *e = list_pop_front(&curr->children);
+		struct child_info *child = list_entry(e, struct child_info, elem);
+		/**부모는 종료하므로 이 자식 기록을 더 이상 사용하지 않음
+	 	* 자식이 살아 있다면 자식 몫이 남아서 기록은 유지*/
+		child_info_release(child);
+	}
+	process_cleanup ();
+
+	if (record != NULL) {	/*이제 자신의 기록을 더 사용하지 않도록 연결 끊기*/
+		curr->child_info = NULL;
+		sema_up(&record->process_sema);
+
+		child_info_release(record);		/*자식도 기록 사용끝냄. 부모도 사용 끝냈다면 이호출에서 기록이 해제*/
+	}
+	
 }
 
 /* 현재 프로세스의 리소스를 해제함. */
