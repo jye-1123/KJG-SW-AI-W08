@@ -1,9 +1,11 @@
 #include "userprog/exception.h"
+#include "userprog/syscall.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h"
 #include "intrinsic.h"
 
 /* 처리한 페이지 폴트(page fault)의 수. */
@@ -79,10 +81,7 @@ kill (struct intr_frame *f) {
 		case SEL_UCSEG:
 			/* 유저의 코드 세그먼트이므로 예상대로 유저 예외임.
 			   유저 프로세스를 종료시킴.  */
-			printf ("%s: dying due to interrupt %#04llx (%s).\n",
-					thread_name (), f->vec_no, intr_name (f->vec_no));
-			intr_dump_frame (f);
-			thread_exit ();
+			sys_exit (-1);
 
 		case SEL_KCSEG:
 			/* 커널의 코드 세그먼트이며, 이는 커널 버그를 의미함.
@@ -142,6 +141,11 @@ page_fault (struct intr_frame *f) {
 
 	/* 페이지 폴트 횟수를 셈. */
 	page_fault_cnt++;
+
+	/* 사용자 예외와 시스템 콜에서 사용자 메모리를 만지다 난 폴트를 종료로 연결함.
+	 * 커널 주소에 대한 커널 폴트는 기존 진단/panic 경로를 유지함. */
+	if (user || (thread_current ()->pml4 != NULL && is_user_vaddr (fault_addr)))
+		sys_exit (-1);
 
 	/* 진짜 폴트라면 정보를 출력하고 종료함. */
 	printf ("Page fault at %p: %s error %s page in %s context.\n",

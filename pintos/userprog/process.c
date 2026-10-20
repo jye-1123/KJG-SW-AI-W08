@@ -13,6 +13,7 @@
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/mmu.h"
@@ -255,18 +256,23 @@ process_wait (tid_t child_tid) {
 void
 process_exit (void) {
 	struct thread *curr = thread_current ();
-	/* TODO: 여기에 코드를 작성할 것.
-	 * TODO: 프로세스 종료 메시지를 구현할 것 (project2/process_termination.html
-	 * TODO: 참고).
-	 * TODO: 프로세스 리소스 정리(cleanup)도 여기서 구현하기를 권장함. */
-	/* 현재 종료 기록은 SYS_EXIT 처리 중에만 생성
-	* 커널 스레드 종료나 예외 종료 등에서는 기록이 없을 수 있으므로
-	* 기록이 존재할 때만 종료 상태를 읽고 출력*/
-	if (curr->exit_info != NULL) {	
-		printf("%s: exit(%d)\n", curr->name, curr->exit_info->status);
-	}
-	/* 종료 기록의 유무와 관계없이 현재 프로세스 주소 공간 정리
-	별도로 할당한 exit_info의 해제는 아직 구현x */
+	bool user_process = curr->pml4 != NULL;
+	int status = -1;
+
+	if (curr->exit_info != NULL)
+		status = curr->exit_info->status;
+	else if (curr->self_info != NULL)
+		status = curr->self_info->exit_status;
+
+	/* 메시지는 이곳에서만 출력하며 커널 스레드에는 출력하지 않음. */
+	if (user_process)
+		printf ("%s: exit(%d)\n", curr->name, status);
+	free (curr->exit_info);
+	curr->exit_info = NULL;
+
+	/* 부모가 wait에서 깨어나기 전에 열린 파일과 주소 공간을 정리함. */
+	fd_table_close_all ();
+	process_cleanup ();
 
 	/* 부모 프로세스로서의 마무리 */
 	if (!list_empty(&curr->children)) {
@@ -293,17 +299,22 @@ process_exit (void) {
 
 	/* 자식 프로세스로서의 마무리 */
 	if (curr->self_info != NULL) {
-		// 부모가 이미 종료된 경우
-		if (curr->self_info->parent_exited) {
-			free(curr->self_info);
-			curr->self_info = NULL;
-		} else { // 부모가 살아 있는 경우
-			curr->self_info->child_exited = true;
-			sema_up(&curr->self_info->wait_sema);
-		}
+		struct child_info *info = curr->self_info;
+		curr->self_info = NULL;
+
+		/* 부모 종료와 상태 게시가 엇갈리지 않도록 함께 보호함. */
+		enum intr_level old_level = intr_disable ();
+		bool parent_exited = info->parent_exited;
+		info->exit_status = status;
+		info->child_exited = true;
+		if (!parent_exited)
+			sema_up (&info->wait_sema);
+		/* sema_up 이후 부모가 info를 해제할 수 있으므로 다시 접근하지 않음. */
+		intr_set_level (old_level);
+
+		if (parent_exited)
+			free (info);
 	}
-	
-	process_cleanup ();
 }
 
 /* 현재 프로세스의 리소스를 해제함. */

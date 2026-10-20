@@ -15,7 +15,7 @@
 #include "threads/palloc.h"
 #include "threads/vaddr.h"
 #include "devices/input.h"
-
+#include "threads/init.h"
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
@@ -59,10 +59,26 @@ syscall_init (void) {
 			FLAG_IF | FLAG_TF | FLAG_DF | FLAG_IOPL | FLAG_AC | FLAG_NT);
 }
 
+/* 정상 종료와 사용자 오류 종료가 같은 상태 기록 경로를 사용함. */
+void
+sys_exit (int status) {
+	struct thread *cur = thread_current ();
+
+	/* 종료 기록 할당에 실패해도 부모에게 전달할 상태는 보존함. */
+	if (cur->self_info != NULL)
+		cur->self_info->exit_status = status;
+	if (cur->exit_info == NULL)
+		cur->exit_info = malloc (sizeof *cur->exit_info);
+	if (cur->exit_info != NULL)
+		cur->exit_info->status = status;
+
+	thread_exit ();
+}
+
 /* 임시로 주소 확인 */
 void check_address(const void *addr) {
 	if (addr == NULL || !is_user_vaddr(addr) || pml4_get_page(thread_current()->pml4, addr) == NULL) {
-		thread_exit(); // 임시
+		sys_exit (-1);
 	}
 }
 
@@ -213,22 +229,10 @@ syscall_handler (struct intr_frame *f UNUSED) {
 	switch (f->R.rax)
 	{
 		case SYS_HALT:
+		power_off();
 			break;
-		case SYS_EXIT: {		/* exit(status) 첫 인자는 rdi로 전달 */
-			int status = (int)f->R.rdi;
-			struct thread *cur = thread_current();
-
-			struct exit_info *record = malloc(sizeof(struct exit_info));		/* 종료 상태 저장할 실제 메모리 공간 할당 */
-			if (record == NULL) {		/* 할당 실패하면 기록에 접근하지 않고 현재 스레드 종료 */
-				thread_exit();
-			}
-			
-			record->status = status;		// 구조체 안에 종료 상태 저장
-
-			cur->exit_info = record;		// process_exit()에서도 같은 기록 찾을 수 있도록 현재 스레드에 구조체 주소 저장
-
-			thread_exit();		/* 내부에서 process_exit() 호출해 자원 정리하고 현재 스레드 종료 */
-		}
+		case SYS_EXIT:		/* exit(status) 첫 인자는 rdi로 전달 */
+			sys_exit ((int) f->R.rdi);
 		case SYS_FORK:
 			break;
 		case SYS_EXEC:
